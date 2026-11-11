@@ -22,8 +22,8 @@ export function BudgetSummary({estimate, budget, stale}: {estimate: Estimate | n
   </div>
 }
 
-export function Collaboration({events, onArtifact, onTimeline, onGeometry}: {
-  events: RoomEvent[]; onArtifact: (id: string) => void; onTimeline: () => void; onGeometry: (event: RoomEvent) => void
+export function Collaboration({events, onArtifact, onTimeline, onGeometry, replaying = false}: {
+  events: RoomEvent[]; onArtifact: (id: string) => void; onTimeline: () => void; onGeometry: (event: RoomEvent) => void; replaying?: boolean
 }) {
   const [filter, setFilter] = useState<'all' | 'messages' | 'tools'>('all')
   const relevant = events.filter(event => event.visibility === 'shared' &&
@@ -37,7 +37,7 @@ export function Collaboration({events, onArtifact, onTimeline, onGeometry}: {
   }, [relevant.length])
   return <section className="panel feed-panel">
     <header className="panel-header"><div className="panel-heading"><span className="panel-icon"><GitBranch size={17}/></span><div><h2>Agent room</h2><p>Shared collaboration</p></div></div>
-      <span className="badge good feed-status"><i/> Live feed</span></header>
+      <span className={`badge ${replaying ? 'quiet' : 'good'} feed-status`}><i/> {replaying ? 'Recorded feed' : 'Live feed'}</span></header>
     <div className="tabs feed-tabs" aria-label="Filter collaboration">
       {(['all', 'messages', 'tools'] as const).map(key => <button key={key} className={filter === key ? 'active' : ''}
         onClick={() => {setFilter(key); if (scroll.current) scroll.current.scrollTop = 0}}>{key === 'all' ? 'All activity' : key === 'messages' ? 'Messages' : 'Tools'}</button>)}
@@ -56,6 +56,7 @@ export function Collaboration({events, onArtifact, onTimeline, onGeometry}: {
               <time>{eventTime(event.timestamp)}</time>
             </div>
             <p>{event.payload.content || event.payload.summary}</p>
+            {!message && event.payload.status && <span className={`badge ${event.payload.status === 'running' ? 'warn' : event.payload.status === 'failed' ? 'warn' : 'quiet'}`}>{event.payload.status === 'running' ? <Hourglass size={11}/> : null} {event.payload.status}</span>}
             <small className="event-provenance">#{event.seq} · Run {event.run_id.slice(0, 8)} · {message ? 'Shared message' : event.type.startsWith('workspace.') ? 'File activity' : 'Tool / task event'}</small>
             {event.payload.artifact_id && <button className="artifact-link" onClick={() => onArtifact(event.payload.artifact_id!)}><FileText size={12}/>{({brief: 'Design brief', bom: 'Material BOM', estimate: 'Estimate', conflict: 'Change request'} as Record<string,string>)[event.payload.artifact_id] || event.payload.artifact_id}<ChevronRight size={11}/></button>}
             {event.payload.checks && event.payload.checks.length > 0 && <button className="artifact-link" onClick={() => onGeometry(event)}><TriangleAlert size={12}/> Inspect candidate <ChevronRight size={11}/></button>}

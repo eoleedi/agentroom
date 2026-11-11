@@ -308,6 +308,12 @@ def test_live_mode_completes_workflow_with_one_env_key_and_scoped_model_context(
         reviewed = wait_for(lambda: state(api), lambda room: room["phase"] == "review")
         assert reviewed["plan_version"] == 2
         assert data(api.get(f"{PROJECT}/budgets/latest"))["body"]["estimated_total"] == 1_480_000
+        for role in ("client_a", "budget", "design"):
+            run_id = data(api.post(f"{PROJECT}/agents/{role}/messages", json={
+                "content": f"Explain the approved trade-off and current source versions for {role}.",
+                "request_id": f"followup-{role}",
+            }), 202)["run_id"]
+            wait_for(lambda: data(api.get(f"{PROJECT}/runs/{run_id}")), lambda run: run["status"] == "completed")
         for role in ROLES:
             data(decision(api, reviewed["review"], role))
         assert state(api)["phase"] == "approved"
@@ -320,7 +326,21 @@ def test_live_mode_completes_workflow_with_one_env_key_and_scoped_model_context(
     for _, _, schema, context in captured:
         serialized = json.dumps(context)
         if schema == "ChatReply":
-            assert {message for message in messages.values() if message in serialized} == {context["latest_user_message"]}
+            private_texts = {message for message in messages.values() if message in serialized}
+            if context["latest_user_message"] in messages.values():
+                assert private_texts == {context["latest_user_message"]}
+            else:
+                assert len(private_texts) == 1
+                assert context['approved_brief']['seating'] == 6
+                assert context['negotiation']['status'] == 'approved'
+                assert context['estimate']['estimated_total'] == 1_480_000
+                if context['latest_user_message'].endswith('design.'):
+                    assert context['previous_plan']['plan_version'] == 1
+                    assert context['plan_changes'][0]['object_id'] == 'island_01'
+                    assert context['validation']['status'] == 'passed'
+                if context['latest_user_message'].endswith('budget.'):
+                    assert context['previous_estimate']['estimated_total'] == 1_620_000
+                    assert context['compact_option_estimate']['estimated_total'] == 1_480_000
         else:
             assert not any(message in serialized for message in messages.values())
 
@@ -445,3 +465,90 @@ def test_cancel_during_model_call_prevents_late_plan_commit_and_retry_resumes(ap
         assert state(api)["plan_version"] == 2
 
     asyncio.run(scenario())
+
+
+def test_multiturn_brief_preserves_preferences_and_invalidates_old_confirmation(api):
+    identifier = data(api.post('/api/projects', json={"name": "Multi-turn brief review"}), 201)["id"]
+    base = f"/api/projects/{identifier}"
+
+    def chat(role, content, key):
+        run = data(api.post(f"{base}/agents/{role}/messages", json={"content": content, "request_id": key}), 202)
+        wait_for(lambda: data(api.get(f"{base}/runs/{run['run_id']}")), lambda item: item['status'] == 'completed')
+        return data(api.get(base))["drafts"][role]
+
+    def approve(role, draft):
+        data(api.post(f"{base}/briefs/{role}/decision", json={"action": "approve", "expected_seq": draft["seq"]}))
+
+    first = chat('client_a', 'I prefer a large 1,800 mm oak island, Warm Japandi, and six seats.', 'multi-first')
+    approve('client_a', first)
+    replacement = chat('client_a', 'Keep the palette warm and simple. I like oak and low storage.', 'multi-second')
+    assert replacement['brief']['island'] == 'large'
+    assert replacement['brief']['priority'] == 'prep_space'
+    assert 'client_a' not in state(api, base)['confirmed_clients']
+    second = chat('client_b', 'Keep all six seats and use a compact island for open circulation.', 'multi-third')
+    approve('client_b', second)
+    assert state(api, base)['phase'] == 'requirements'
+    data(api.get(f"{base}/artifacts/plan"), 404)
+    approve('client_a', replacement)
+    wait_for(lambda: state(api, base), lambda item: item['phase'] == 'negotiation')
+    assert data(api.get(f"{base}/budgets/latest"))['body']['estimated_total'] == 1_620_000
+
+
+def test_agent_room_tracks_real_handoffs_validation_and_recosting(api):
+    prepare_review(api)
+    events = data(api.get(f'{PROJECT}/events'))['events']
+    shared = [event for event in events if event['visibility'] == 'shared']
+    messages = [event for event in shared if event['type'] == 'agent.message']
+    assert {'Requirement Agent', 'Budget Agent', 'Design Agent'} == {event['actor'] for event in messages}
+    failed_check = next(event for event in shared if event['type'] == 'agent.tool_event' and event['payload'].get('status') == 'failed')
+    explanation = next(event for event in messages if '450 mm' in event['payload']['content'])
+    assert explanation['run_id'] == failed_check['run_id']
+    assert explanation['seq'] > failed_check['seq']
+    assert any('1,620,000' in event['payload']['content'] for event in messages)
+    assert any('1,480,000' in event['payload']['content'] for event in messages)
+    assert any('compact-island revision' in event['payload']['content'] for event in messages)
+    assert all(event['payload'].get('recipient') for event in messages)
+    assert not any(event['type'] == 'private.message.created' for event in shared)
+    assert len({event['event_id'] for event in shared}) == len(shared)
+
+
+def test_interrupted_demo_seed_resumes_after_project_creation(tmp_path):
+    from app.agents import GMI
+    from app.store import Store
+    from app.workflow import Workflow
+
+    path = tmp_path / 'interrupted.sqlite3'
+    store = Store(path)
+    store.initialize()
+    workflow = Workflow(store, GMI(''), True)
+    workflow.initialize_project('oak-residence', 'The Oak Residence', 1500000, seed_demo=True)
+    with store.connect(write=True) as db:
+        workflow.queue_chat(db, 'oak-residence', 'client_a', 'I want a large island.', 'seed:client_a')
+    asyncio.run(workflow.execute(store.claim()))
+    with TestClient(create_app(db_path=path, mode='demo')) as client:
+        assert state(client)['phase'] == 'negotiation'
+        assert state(client)['plan_version'] == 1
+        assert len(data(client.get(f'{PROJECT}/messages?channel=client_a'))) == 2
+    with TestClient(create_app(db_path=path, mode='demo')) as client:
+        assert state(client)['plan_version'] == 1
+        assert len(data(client.get(f'{PROJECT}/messages?channel=client_a'))) == 2
+
+
+def test_pending_client_correction_blocks_reconciliation_before_reply(api):
+    workflow = api.app.state.workflow
+    store = workflow.store
+    project_id = data(api.post('/api/projects', json={"name": "Pending correction"}), 201)['id']
+    base = f'/api/projects/{project_id}'
+    for role, text in (('client_a', 'I want a large island.'), ('client_b', 'I want a compact island.')):
+        run = data(api.post(f'{base}/agents/{role}/messages', json={'content': text, 'request_id': f'pending-{role}'}), 202)
+        wait_for(lambda: data(api.get(f"{base}/runs/{run['run_id']}")), lambda item: item['status'] == 'completed')
+    drafts = data(api.get(base))['drafts']
+    with store.connect(write=True) as db:
+        workflow.confirm_brief(db, project_id, 'client_a', drafts['client_a']['seq'], 'approve')
+        run_id = workflow.queue_chat(db, project_id, 'client_a', 'Actually, prioritize open circulation.', 'pending-correction')
+        assert workflow.queue_chat(db, project_id, 'client_a', 'Actually, prioritize open circulation.', 'pending-correction') == run_id
+        workflow.confirm_brief(db, project_id, 'client_b', drafts['client_b']['seq'], 'approve')
+        current = store.project(db, project_id)['state']
+        assert current['phase'] == 'requirements'
+        assert current['confirmed_clients'] == ['client_b']
+        assert not db.execute("SELECT 1 FROM jobs WHERE project_id=? AND kind='initial'", (project_id,)).fetchone()

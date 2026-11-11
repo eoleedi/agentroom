@@ -178,9 +178,10 @@ class Store:
             raise DomainError(409, "This request key was already used for a different action.")
         return row["id"], False
 
-    def claim(self):
+    def claim(self, project_id=None):
         with self.connect(write=True) as db:
-            job = db.execute("SELECT * FROM jobs WHERE status='queued' ORDER BY created_at LIMIT 1").fetchone()
+            job = db.execute("SELECT * FROM jobs WHERE status='queued' AND (? IS NULL OR project_id=?) ORDER BY created_at LIMIT 1",
+                             (project_id, project_id)).fetchone()
             if job is None:
                 return None
             db.execute("UPDATE jobs SET status='running', attempts=attempts+1 WHERE id=?", (job["id"],))

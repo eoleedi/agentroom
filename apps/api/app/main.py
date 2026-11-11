@@ -66,8 +66,8 @@ def create_app(db_path=None, mode=None, provider=None, seed=True):
     @asynccontextmanager
     async def lifespan(_app):
         store.initialize()
-        created = workflow.initialize_project(default_id, "The Oak Residence", 1500000)
-        if created and demo and seed:
+        workflow.initialize_project(default_id, "The Oak Residence", 1500000, seed_demo=demo and seed)
+        if demo and seed:
             await workflow.seed_demo(default_id)
         worker = asyncio.create_task(workflow.worker())
         try:
@@ -119,6 +119,7 @@ def create_app(db_path=None, mode=None, provider=None, seed=True):
             drafts = state.pop("drafts")
             state.pop("confirmed")
             state.pop("pending_brief")
+            state.pop("demo_seed_pending", None)
             if at is not None:
                 row = db.execute(
                     "SELECT payload FROM events WHERE project_id=? AND type='room.state' AND seq<=? ORDER BY seq DESC LIMIT 1",

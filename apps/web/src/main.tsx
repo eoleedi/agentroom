@@ -257,11 +257,12 @@ function Dashboard({health}: {health: Health}) {
     setDialog('validation'); setCandidate(null); setGeometryError(''); setGeometryBusy(true)
     try {
       type Candidates = Artifact<{plan: Plan; validation: Validation}[]>
-      const file = await request<Candidates>(`${base}/artifacts/candidate`)
+      const history = at === null ? '' : `&at=${at}`
+      const file = await request<Candidates>(`${base}/artifacts/candidate${query}`)
       let entries = file.body
       for (const candidateVersion of file.versions) {
         if (entries.some(entry => entry.plan.plan_version === event.payload.plan_version)) break
-        if (candidateVersion !== file.version) entries = (await request<Candidates>(`${base}/artifacts/candidate?version=${candidateVersion}`)).body
+        if (candidateVersion !== file.version) entries = (await request<Candidates>(`${base}/artifacts/candidate?version=${candidateVersion}${history}`)).body
       }
       const failed = entries.find(entry => entry.plan.plan_version === event.payload.plan_version && entry.validation.status === 'failed' &&
         entry.validation.checks.some(check => event.payload.checks?.some(other => other.message === check.message)))
@@ -336,14 +337,15 @@ function Dashboard({health}: {health: Health}) {
               <button className="button primary" onClick={() => goto(hasApproval ? 'approvals' : 'workspace')}>{hasApproval ? 'Review decision' : 'Open workspace'}<ArrowRight size={16}/></button>
             </div>
           </section>
-          <div className="budget-strip"><BudgetSummary estimate={estimate} budget={currentProject.budget} stale={state.budget_stale}/></div>
+           <div className="budget-strip"><BudgetSummary estimate={estimate} budget={currentProject.budget}
+             stale={state.budget_stale || !!(estimate && version && estimate.source_plan_version !== version)}/></div>
           <div className="dashboard-grid">
             <PlanPanel plan={version ? plan : roomPreview} referenceOnly={!version} versions={versions} version={version} setVersion={value => {setChosenVersion(value); setSelected([])}} operations={partialPatch}
               selected={selected} setSelected={setSelected} approved={state.approved_plan_version === version} validation={!!report}
               onValidation={() => {setCandidate(null); setGeometryError(''); setDialog('validation')}} changed={version > 1 ? changed : []}
               onEdit={at === null && version === state.plan_version && !state.budget_stale && ['review', 'changes_requested'].includes(state.phase)
                 && ['overview', 'design'].includes(currentProject.actor) ? editPlacement : undefined}/>
-            <Collaboration events={visibleEvents} onArtifact={showArtifact} onTimeline={() => goto('timeline')} onGeometry={event => void inspectCandidate(event)}/>
+            <Collaboration events={visibleEvents} replaying={at !== null} onArtifact={showArtifact} onTimeline={() => goto('timeline')} onGeometry={event => void inspectCandidate(event)}/>
           </div>
           {!state.plan_version && at === null && <section className="overview-banner" role="status"><ScanLineNotice phase={state.phase} confirmed={state.confirmed_clients.length}/>
             <button className="button small secondary" onClick={() => document.getElementById('participant-conversations')?.scrollIntoView({behavior: 'smooth'})}>Open requirement chats</button></section>}

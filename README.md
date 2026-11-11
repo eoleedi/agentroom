@@ -2,6 +2,8 @@
 
 AgentRoom Interior is a local collaboration workspace for a residential kitchen and dining project. Two clients share their preferences with the Requirement Agent in separate conversations. The Design Agent proposes layouts, and the Budget Agent explains estimates calculated from the layout’s bill of materials. Participants review the same plan, files, and decisions.
 
+For the full English walkthrough, including each participant's private conversation, public agent handoffs, and approval actions, see [AgentRoom_Demo_Conversation_EN.md](AgentRoom_Demo_Conversation_EN.md). This is a scenario script, not a verbatim live transcript.
+
 ## Start locally
 
 Install [uv](https://docs.astral.sh/uv/), Python 3.11 or later, and Node.js 22.12 or later. Run these commands from the project root.
@@ -68,6 +70,10 @@ GMI_BASE_URL=https://api.gmi-serving.com/v1
 All three agents use the same server-side `GMI_API_KEY` and the Qwen 3.8 27B model. Each agent has its own prompt and schema. The browser receives no provider key, and participants need no separate tokens. Obtain the key from [GMI Cloud](https://console.gmicloud.ai/).
 
 Start by sending a preference message from each client card. Review and confirm each structured brief. Once both are confirmed, the agents reconcile priorities, propose a layout, validate the geometry, and price the resulting BOM. The approval inbox shows the next action. Budget and design conversations accept follow-up questions at any stage. Live projects start with the synthetic room and catalog so that the model has known dimensions and product choices. Model output can vary. A layout enters review only after validation and costing.
+
+Before both briefs are confirmed, the canvas shows the room outline with an **Awaiting briefs** label. This is a reference, not a generated furniture layout. The confirmation counter and **Open requirement chats** button show the next step. After confirmation, the agents generate and validate the furniture layout; approved geometry then appears on the canvas. A failed run offers retry under **Approvals**.
+
+The **Agent room** displays persisted public handoffs from Requirement, Design, and Budget, with event sequence numbers and run identifiers. Switch to **Messages** for discussion or **Tools** for validation, task status, and file reads/writes. Private participant messages remain in their individual cards. Live follow-up questions receive the applicable shared proposals and versioned design/budget facts; they do not perform an approval or change the plan by themselves.
 
 This MVP uses a trusted local participant overview. Individual conversations are stored separately from shared agent handoffs and omitted from the shared activity feed. Anyone with access to the local overview can act as any participant. Keep the development server bound to localhost. Live mode sends the active thread and its scoped context to GMI Cloud for inference.
 

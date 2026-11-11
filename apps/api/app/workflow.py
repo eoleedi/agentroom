@@ -29,7 +29,7 @@ class Workflow:
 
     def snapshot(self, db, project_id, state, run_id):
         self.store.update(db, project_id, state)
-        public = {key: value for key, value in state.items() if key not in ("drafts", "confirmed", "pending_brief")}
+        public = {key: value for key, value in state.items() if key not in ("drafts", "confirmed", "pending_brief", "demo_seed_pending")}
         self.store.emit(db, project_id, run_id, "room.state", "AgentRoom", public)
 
     def shared(self, db, project_id, run_id, role, to, content, **payload):
@@ -40,7 +40,7 @@ class Workflow:
         self.store.emit(db, project_id, run_id, "agent.tool_event", AGENTS[role],
                         {"tool": name, "summary": summary, **payload})
 
-    def initialize_project(self, project_id, name, budget):
+    def initialize_project(self, project_id, name, budget, seed_demo=False):
         run_id = uuid4().hex
         with self.store.connect(write=True) as db:
             if db.execute("SELECT 1 FROM projects WHERE id=?", (project_id,)).fetchone():
@@ -49,6 +49,7 @@ class Workflow:
                 "phase": "requirements", "drafts": {}, "confirmed": {}, "pending_brief": {},
                 "confirmed_clients": [], "brief_version": 0, "plan_version": 0, "estimate_version": 0,
                 "budget_stale": False, "negotiation": None, "review": None, "approved_plan_version": None,
+                "demo_seed_pending": seed_demo,
             }
             db.execute("INSERT INTO projects VALUES (?,?,?,?)", (project_id, name, budget, encode(state)))
             for artifact, value in (
@@ -63,10 +64,26 @@ class Workflow:
         return True
 
     def queue_chat(self, db, project_id, role, content, key):
-        run_id, created = self.store.enqueue(db, project_id, key, "chat", {"role": role, "content": content})
+        prior_job = db.execute("SELECT id,kind,payload FROM jobs WHERE project_id=? AND request_key=?", (project_id, key)).fetchone()
+        if prior_job:
+            previous = json.loads(prior_job["payload"])
+            if prior_job["kind"] != "chat" or previous["role"] != role or previous["content"] != content:
+                raise DomainError(409, "This request key was already used for a different action.")
+            return prior_job["id"]
+        state = self.store.project(db, project_id)["state"]
+        previous_brief = state["drafts"].get(role, {}).get("brief") or state["confirmed"].get(role)
+        run_id, created = self.store.enqueue(db, project_id, key, "chat", {
+            "role": role, "content": content, "previous_brief": previous_brief,
+        })
         if created:
             self.store.emit(db, project_id, run_id, "private.message.created", NAMES[role],
                             {"role": role, "content": content, "speaker": "human"}, role)
+            if role in CLIENTS and state["phase"] == "requirements":
+                state["confirmed"].pop(role, None)
+                state["pending_brief"].pop(role, None)
+                state["drafts"].pop(role, None)
+                state["confirmed_clients"] = list(state["confirmed"])
+                self.snapshot(db, project_id, state, run_id)
         return run_id
 
     def confirm_brief(self, db, project_id, role, expected, action):
@@ -248,7 +265,7 @@ class Workflow:
             previous_estimate = self.store.artifact(db, project_id, "estimate", role, version-1)["body"] if version > 1 else None
             approved_brief = self.store.artifact(db, project_id, "brief", role, state["brief_version"])["body"] if state["brief_version"] else None
             validation = self.store.artifact(db, project_id, "validation", role)["body"] if plan_version else None
-            prior_brief = state["drafts"].get(role, {}).get("brief") or state["confirmed"].get(role)
+            prior_brief = job["payload"].get("previous_brief") or state["drafts"].get(role, {}).get("brief") or state["confirmed"].get(role)
             compact_estimate = None
             if role == "budget" and plan_version:
                 prices = self.store.artifact(db, project_id, "price", role)
@@ -341,6 +358,12 @@ class Workflow:
         state = project["state"]
         previous = None
         if kind == "initial":
+            with self.store.connect(write=True) as db:
+                self.store.require_active(db, run_id)
+                self.shared(db, project_id, run_id, "client_a", "Design Agent",
+                            "Both client briefs are confirmed. I am reconciling the shared priorities before handing off the design brief.")
+                self.tool(db, project_id, run_id, "client_a", "reconcile_requirements",
+                          "Reconciling the two approved briefs.", status="running")
             brief = await self.reconcile(project_id, run_id, project)
             compact = brief["island_baseline"] == "compact"
         else:
@@ -353,6 +376,8 @@ class Workflow:
             self.store.require_active(db, run_id)
             state = self.store.project(db, project_id)["state"]
             if kind == "initial" and not state["brief_version"]:
+                self.tool(db, project_id, run_id, "client_a", "reconcile_requirements",
+                          brief["summary"], status="completed")
                 brief_version = self.store.write(db, project_id, run_id, "brief", brief, 0, status="approved")
                 state["brief_version"] = brief_version
                 materials = geo.MATERIALS
@@ -379,7 +404,17 @@ class Workflow:
         feedback = None
         candidates = []
         for attempt in range(3):
+            with self.store.connect(write=True) as db:
+                self.store.require_active(db, run_id)
+                self.tool(db, project_id, run_id, "design", "propose_layout",
+                          f"Generating candidate {attempt+1} for floor plan v{version} using the approved brief and catalog.",
+                          status="running", plan_version=version)
             layout = await self.propose_layout(compact, brief, previous, feedback)
+            with self.store.connect(write=True) as db:
+                self.store.require_active(db, run_id)
+                self.tool(db, project_id, run_id, "design", "propose_layout",
+                          f"Candidate {attempt+1} returned; checking catalog authorization and geometry.",
+                          status="completed", plan_version=version)
             expected = "island-compact" if compact else "island-large"
             if layout.island_01.catalog_id != expected:
                 feedback = {"summary": f"The authorized island catalog ID is {expected}."}
@@ -430,6 +465,9 @@ class Workflow:
             bom = self.store.read_for_agent(db, project_id, run_id, "bom", "budget")
             prices = self.store.read_for_agent(db, project_id, run_id, "price", "budget")
             previous = self.store.artifact(db, project_id, "estimate", "budget")["body"] if state["estimate_version"] else None
+            self.tool(db, project_id, run_id, "budget", "calculate_estimate",
+                      f"Calculating the estimate from BOM v{bom['version']} and price catalog v{prices['version']}.",
+                      status="running", artifact_id="bom")
         estimate = geo.calculate_estimate(bom["body"], project["budget"], bom["version"], prices["version"], prices["body"])
         alternative = None
         if estimate["remaining"] < 0:
@@ -562,14 +600,22 @@ class Workflow:
 
     async def seed_demo(self, project_id):
         with self.store.connect(write=True) as db:
+            state = self.store.project(db, project_id)["state"]
+            if not state.get("demo_seed_pending"):
+                return
             for role, content in DEMO_INPUTS.items():
-                self.queue_chat(db, project_id, role, content, f"seed:{role}")
-        for _ in CLIENTS:
-            job = self.store.claim()
+                if state["phase"] == "requirements" and role not in state["drafts"] and role not in state["confirmed"]:
+                    self.queue_chat(db, project_id, role, content, f"seed:{role}")
+        while job := self.store.claim(project_id):
             await self.execute(job)
         for role in CLIENTS:
             with self.store.connect(write=True) as db:
-                draft = self.store.project(db, project_id)["state"]["drafts"][role]
-                self.confirm_brief(db, project_id, role, draft["seq"], "approve")
-        job = self.store.claim()
-        await self.execute(job)
+                state = self.store.project(db, project_id)["state"]
+                if state["phase"] == "requirements" and role in state["drafts"]:
+                    self.confirm_brief(db, project_id, role, state["drafts"][role]["seq"], "approve")
+        while job := self.store.claim(project_id):
+            await self.execute(job)
+        with self.store.connect(write=True) as db:
+            state = self.store.project(db, project_id)["state"]
+            state["demo_seed_pending"] = False
+            self.store.update(db, project_id, state)
